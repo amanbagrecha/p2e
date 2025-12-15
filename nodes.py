@@ -183,6 +183,10 @@ def p2e_and_blend_torch(
     # Convert BHWC → BCHW for grid_sample
     pers_bchw = perspective.permute(0, 3, 1, 2)
 
+    # Scale to [0,255] range for better float32 precision during interpolation
+    # (matches original implementation which loaded uint8 images)
+    pers_bchw = pers_bchw * 255.0
+
     # Expand grid for batch
     grid_batch = grid.expand(batch_size, -1, -1, -1)
 
@@ -197,6 +201,9 @@ def p2e_and_blend_torch(
 
     # Convert BCHW → BHWC
     patch_360 = out_bchw.permute(0, 2, 3, 1)
+
+    # Scale back to [0,1] range for ComfyUI output format
+    patch_360 = patch_360 / 255.0
 
     # -------------------------
     # Feathering (optional)
