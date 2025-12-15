@@ -1,0 +1,359 @@
+"""
+ComfyUI Node: Perspective to Equirectangular with Blending
+
+Pure PyTorch implementation for projecting perspective images onto equirectangular
+panoramas with seamless blending.
+"""
+
+import torch
+import torch.nn.functional as F
+
+try:
+    import comfy.model_management as mm
+    COMFY_AVAILABLE = True
+except ImportError:
+    COMFY_AVAILABLE = False
+
+
+def p2e_and_blend_torch(
+    perspective: torch.Tensor,
+    equi_base: torch.Tensor,
+    fov_deg: tuple,
+    u_deg: float,
+    v_deg: float,
+    feather: int = 0,
+    device: torch.device = None
+) -> tuple:
+    """
+    Project perspective image onto equirectangular base with blending.
+
+    Pure PyTorch implementation - no NumPy dependencies.
+
+    Args:
+        perspective: torch.Tensor, BHWC, float32, [0,1] - Perspective image(s)
+        equi_base: torch.Tensor, BHWC, float32, [0,1] - Equirectangular base image(s)
+        fov_deg: tuple (fov_w, fov_h) - Field of view in degrees
+        u_deg: float - Horizontal rotation in degrees (yaw)
+        v_deg: float - Vertical rotation in degrees (pitch)
+        feather: int - Feather radius for smooth blending (default: 0)
+        device: torch.device - Device to use (default: auto-detect)
+
+    Returns:
+        tuple of (merged, patch_360, mask):
+            - merged: BHWC, float32, [0,1] - Blended result
+            - patch_360: BHWC, float32, [0,1] - Perspective warped to equirectangular
+            - mask: BHW, float32, [0,1] - Blend mask
+    """
+    # Device management
+    if device is None:
+        if COMFY_AVAILABLE:
+            device = mm.get_torch_device()
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Move inputs to device and ensure float32 (grid_sample doesn't support BFloat16)
+    perspective = perspective.to(device=device, dtype=torch.float32)
+    equi_base = equi_base.to(device=device, dtype=torch.float32)
+
+    # Batch handling
+    b_persp = perspective.shape[0]
+    b_equi = equi_base.shape[0]
+
+    if b_persp == b_equi:
+        batch_size = b_persp
+    elif b_persp == 1:
+        batch_size = b_equi
+        perspective = perspective.expand(b_equi, -1, -1, -1)
+    elif b_equi == 1:
+        batch_size = b_persp
+        equi_base = equi_base.expand(b_persp, -1, -1, -1)
+    else:
+        raise ValueError(
+            f"Incompatible batch sizes: perspective={b_persp}, equi_base={b_equi}. "
+            f"Expected: both equal, or one equals 1."
+        )
+
+    # Initialize caches as function attributes
+    if not hasattr(p2e_and_blend_torch, "_grid_cache"):
+        p2e_and_blend_torch._grid_cache = {}
+    if not hasattr(p2e_and_blend_torch, "_gauss_cache"):
+        p2e_and_blend_torch._gauss_cache = {}
+
+    # Extract dimensions
+    h_eq, w_eq = equi_base.shape[1:3]
+    h_p, w_p = perspective.shape[1:3]
+    fov_w, fov_h = float(fov_deg[0]), float(fov_deg[1])
+
+    # Create cache key with device string
+    device_str = str(device)
+    cache_key = (h_eq, w_eq, h_p, w_p, fov_w, fov_h, float(u_deg), float(v_deg), device_str)
+
+    # -------------------------
+    # Grid generation (cached)
+    # -------------------------
+    if cache_key not in p2e_and_blend_torch._grid_cache:
+        # Create equirectangular coordinate grid
+        eq_y, eq_x = torch.meshgrid(
+            torch.arange(h_eq, device=device, dtype=torch.float32),
+            torch.arange(w_eq, device=device, dtype=torch.float32),
+            indexing="ij"
+        )
+
+        # Convert to spherical coordinates
+        theta = (eq_x / w_eq - 0.5) * (2.0 * torch.pi)
+        phi = -(eq_y / h_eq - 0.5) * torch.pi
+
+        # Convert to 3D unit vectors
+        x = torch.cos(phi) * torch.sin(theta)
+        y = torch.sin(phi)
+        z = torch.cos(phi) * torch.cos(theta)
+        xyz = torch.stack([x, y, z], dim=-1)
+
+        # Rotation angles
+        u = torch.deg2rad(torch.tensor(float(u_deg), device=device, dtype=torch.float32))
+        v = torch.deg2rad(torch.tensor(float(-v_deg), device=device, dtype=torch.float32))
+
+        cu, su = torch.cos(u), torch.sin(u)
+        cv, sv = torch.cos(v), torch.sin(v)
+
+        z0 = torch.tensor(0.0, device=device, dtype=torch.float32)
+        o1 = torch.tensor(1.0, device=device, dtype=torch.float32)
+
+        # Rotation matrices
+        Ry = torch.stack([
+            torch.stack([ cu, z0, -su]),
+            torch.stack([ z0, o1,  z0]),
+            torch.stack([ su, z0,  cu]),
+        ], dim=0)
+
+        Rx = torch.stack([
+            torch.stack([ o1, z0,  z0]),
+            torch.stack([ z0,  cv, -sv]),
+            torch.stack([ z0,  sv,  cv]),
+        ], dim=0)
+
+        # Apply rotation
+        R = Ry @ Rx
+        xyz_cam = xyz @ R
+
+        # Check validity (in front of camera)
+        valid = xyz_cam[..., 2] > 0
+        z_safe = torch.where(valid, xyz_cam[..., 2], torch.ones_like(xyz_cam[..., 2]))
+
+        # Project to perspective coordinates
+        x_p = xyz_cam[..., 0] / z_safe
+        y_p = xyz_cam[..., 1] / z_safe
+
+        # FOV calculations
+        tan_h = torch.tan(torch.deg2rad(torch.tensor(fov_w, device=device, dtype=torch.float32)) / 2.0)
+        tan_v = torch.tan(torch.deg2rad(torch.tensor(fov_h, device=device, dtype=torch.float32)) / 2.0)
+
+        # Check if within FOV
+        in_fov = valid & (x_p.abs() <= tan_h) & (y_p.abs() <= tan_v)
+
+        # Convert to pixel coordinates
+        u_px = (x_p / tan_h + 1.0) * 0.5 * w_p
+        v_px = (-y_p / tan_v + 1.0) * 0.5 * h_p
+
+        # Create mapping coordinates
+        map_x = torch.where(in_fov, u_px, torch.full_like(u_px, -1.0))
+        map_y = torch.where(in_fov, v_px, torch.full_like(v_px, -1.0))
+
+        # Normalize to [-1, 1] for grid_sample
+        grid_x = (map_x / (w_p - 1.0)) * 2.0 - 1.0
+        grid_y = (map_y / (h_p - 1.0)) * 2.0 - 1.0
+
+        # Create grid [1, H, W, 2]
+        grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+
+        # Create mask (HW, uint8 with values 0 or 255)
+        mask_t = (in_fov.to(torch.uint8) * 255)
+
+        # Store in cache
+        p2e_and_blend_torch._grid_cache[cache_key] = (grid, mask_t)
+    else:
+        grid, mask_t = p2e_and_blend_torch._grid_cache[cache_key]
+
+    # -------------------------
+    # Grid sampling
+    # -------------------------
+    # Ensure grid is float32 (in case old cache has different dtype)
+    grid = grid.to(dtype=torch.float32)
+
+    # Convert BHWC → BCHW for grid_sample
+    pers_bchw = perspective.permute(0, 3, 1, 2)
+
+    # Expand grid for batch
+    grid_batch = grid.expand(batch_size, -1, -1, -1)
+
+    # Apply grid_sample (requires float32 inputs)
+    out_bchw = F.grid_sample(
+        pers_bchw,
+        grid_batch,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True
+    )
+
+    # Convert BCHW → BHWC
+    patch_360 = out_bchw.permute(0, 2, 3, 1)
+
+    # -------------------------
+    # Feathering (optional)
+    # -------------------------
+    if feather > 0:
+        k = int(feather) * 2 + 1
+
+        # Prepare mask for erosion [1, 1, H, W] - convert to [0,1] range
+        m = (mask_t.to(torch.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+
+        # Erosion via negative max pooling
+        m_eroded = -F.max_pool2d(-m, kernel_size=k, stride=1, padding=k // 2)
+
+        # Gaussian blur cache
+        gauss_key = (k, device_str)
+        if gauss_key not in p2e_and_blend_torch._gauss_cache:
+            # Generate 1D Gaussian kernel
+            sigma = 0.3 * ((k - 1) * 0.5 - 1) + 0.8
+            xs = torch.arange(k, device=device, dtype=torch.float32) - (k - 1) / 2.0
+            g = torch.exp(-(xs * xs) / (2.0 * sigma * sigma))
+            g = (g / g.sum()).to(torch.float32)
+            kx = g.view(1, 1, 1, k)
+            ky = g.view(1, 1, k, 1)
+            p2e_and_blend_torch._gauss_cache[gauss_key] = (kx, ky)
+        else:
+            kx, ky = p2e_and_blend_torch._gauss_cache[gauss_key]
+
+        # Apply separable Gaussian blur
+        m_pad = F.pad(m_eroded, (k // 2, k // 2, 0, 0), mode="reflect")
+        m_blur = F.conv2d(m_pad, kx)
+        m_pad = F.pad(m_blur, (0, 0, k // 2, k // 2), mode="reflect")
+        m_blur = F.conv2d(m_pad, ky)
+
+        alpha = m_blur.squeeze(0).squeeze(0)  # [H, W]
+    else:
+        alpha = (mask_t.to(torch.float32) / 255.0)  # [H, W] in [0,1]
+
+    # -------------------------
+    # Blending
+    # -------------------------
+    # Expand alpha for batch and channels [B, H, W, C]
+    num_channels = equi_base.shape[3]
+    alpha_bhwc = alpha.unsqueeze(0).unsqueeze(-1)  # [1, H, W, 1]
+    alpha_bhwc = alpha_bhwc.expand(batch_size, -1, -1, num_channels)
+
+    # Alpha blend: merged = base * (1 - alpha) + patch * alpha
+    merged = equi_base * (1.0 - alpha_bhwc) + patch_360 * alpha_bhwc
+
+    # Prepare mask output [B, H, W]
+    mask_out = alpha.unsqueeze(0).expand(batch_size, -1, -1)
+
+    return merged, patch_360, mask_out
+
+
+# -------------------------
+# ComfyUI Node Class
+# -------------------------
+
+class P2EAndBlendNode:
+    """
+    Perspective to Equirectangular with Blending
+
+    Projects a perspective image onto an equirectangular base image with optional
+    feathering for seamless blending.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "perspective": ("IMAGE",),
+                "equi_base": ("IMAGE",),
+                "fov_w": ("FLOAT", {
+                    "default": 140.0,
+                    "min": 1.0,
+                    "max": 180.0,
+                    "step": 0.1,
+                    "tooltip": "Horizontal field of view in degrees"
+                }),
+                "fov_h": ("FLOAT", {
+                    "default": 140.0,
+                    "min": 1.0,
+                    "max": 180.0,
+                    "step": 0.1,
+                    "tooltip": "Vertical field of view in degrees"
+                }),
+                "u_deg": ("FLOAT", {
+                    "default": 0.0,
+                    "min": -180.0,
+                    "max": 180.0,
+                    "step": 0.1,
+                    "tooltip": "Horizontal rotation in degrees (yaw)"
+                }),
+                "v_deg": ("FLOAT", {
+                    "default": 0.0,
+                    "min": -90.0,
+                    "max": 90.0,
+                    "step": 0.1,
+                    "tooltip": "Vertical rotation in degrees (pitch)"
+                }),
+                "feather": ("INT", {
+                    "default": 10,
+                    "min": 0,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Feather/blur radius for blending edge"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK")
+    RETURN_NAMES = ("merged", "patch_360", "mask")
+    FUNCTION = "process"
+    CATEGORY = "image/360"
+
+    def process(self, perspective, equi_base, fov_w, fov_h, u_deg, v_deg, feather):
+        """
+        Process perspective-to-equirectangular projection and blending.
+
+        Args:
+            perspective: torch.Tensor, BHWC, float32, [0,1]
+            equi_base: torch.Tensor, BHWC, float32, [0,1]
+            fov_w: float, horizontal FOV in degrees
+            fov_h: float, vertical FOV in degrees
+            u_deg: float, horizontal rotation in degrees
+            v_deg: float, vertical rotation in degrees
+            feather: int, feather radius in pixels
+
+        Returns:
+            tuple: (merged, patch_360, mask)
+        """
+        # Validate inputs
+        assert perspective.dim() == 4, f"perspective should be 4D BHWC, got {perspective.shape}"
+        assert equi_base.dim() == 4, f"equi_base should be 4D BHWC, got {equi_base.shape}"
+
+        # Call pure torch function
+        merged, patch_360, mask = p2e_and_blend_torch(
+            perspective=perspective,
+            equi_base=equi_base,
+            fov_deg=(fov_w, fov_h),
+            u_deg=u_deg,
+            v_deg=v_deg,
+            feather=feather,
+            device=None  # Let function determine device
+        )
+
+        return (merged, patch_360, mask)
+
+
+# -------------------------
+# Node Registration
+# -------------------------
+
+NODE_CLASS_MAPPINGS = {
+    "P2E And Blend": P2EAndBlendNode,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "P2E And Blend": "Perspective to Equirectangular + Blend",
+}
