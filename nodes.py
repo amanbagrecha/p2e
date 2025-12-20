@@ -7,6 +7,7 @@ panoramas with seamless blending.
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 try:
     import comfy.model_management as mm
@@ -15,9 +16,113 @@ except ImportError:
     COMFY_AVAILABLE = False
 
 
+def _to_bhwc_tensor(image, device=None):
+    """Convert a NumPy array or torch tensor image to BHWC float32 tensor.
+
+    Returns the normalized tensor along with metadata required to restore the
+    original layout, dtype, and container type.
+    """
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if isinstance(image, np.ndarray):
+        input_type = "numpy"
+        orig_dtype = image.dtype
+        tensor = torch.from_numpy(image)
+        orig_device = device
+    elif torch.is_tensor(image):
+        input_type = "torch"
+        orig_dtype = image.dtype
+        tensor = image
+        orig_device = image.device
+    else:
+        raise TypeError(f"Unsupported image type: {type(image)}. Expected numpy array or torch tensor.")
+
+    layout = None
+    if tensor.dim() == 2:
+        # H x W → 1-channel BHWC
+        tensor = tensor.unsqueeze(-1).unsqueeze(0)
+        layout = "hw"
+    elif tensor.dim() == 3:
+        if tensor.shape[-1] in (1, 3, 4):
+            # H x W x C
+            tensor = tensor.unsqueeze(0)
+            layout = "hwc"
+        elif tensor.shape[0] in (1, 3, 4):
+            # C x H x W
+            tensor = tensor.permute(1, 2, 0).unsqueeze(0)
+            layout = "chw"
+        else:
+            raise ValueError(f"Unsupported 3D layout with shape {tuple(tensor.shape)}")
+    elif tensor.dim() == 4:
+        if tensor.shape[-1] in (1, 3, 4):
+            layout = "bhwc"
+        elif tensor.shape[1] in (1, 3, 4):
+            tensor = tensor.permute(0, 2, 3, 1)
+            layout = "bchw"
+        else:
+            raise ValueError(f"Unsupported 4D layout with shape {tuple(tensor.shape)}")
+    else:
+        raise ValueError(f"Unsupported tensor dimensions: {tensor.dim()}. Expected 2D-4D image tensor.")
+
+    # Normalize to float32 in [0,1]
+    if tensor.is_floating_point():
+        norm = tensor.to(device=device, dtype=torch.float32)
+        scale = None
+    else:
+        info = torch.iinfo(tensor.dtype)
+        norm = tensor.to(device=device, dtype=torch.float32) / float(info.max)
+        scale = float(info.max)
+
+    metadata = {
+        "input_type": input_type,
+        "orig_dtype": orig_dtype,
+        "orig_device": orig_device,
+        "layout": layout,
+        "scale": scale,
+    }
+
+    return norm, metadata
+
+
+def _restore_from_bhwc(tensor, metadata):
+    """Restore tensor to original container type, layout, dtype, and device."""
+
+    layout = metadata["layout"]
+    if layout == "hw":
+        tensor = tensor.squeeze(0).squeeze(-1)
+    elif layout == "hwc":
+        tensor = tensor.squeeze(0)
+    elif layout == "chw":
+        tensor = tensor.squeeze(0).permute(2, 0, 1)
+    elif layout == "bhwc":
+        pass
+    elif layout == "bchw":
+        tensor = tensor.permute(0, 3, 1, 2)
+    else:
+        raise ValueError(f"Unknown layout metadata: {layout}")
+
+    # Rescale if original data was integer
+    if metadata["scale"]:
+        tensor = (tensor * metadata["scale"]).round().clamp(0, metadata["scale"])
+
+    # Cast and place back on original container
+    if metadata["input_type"] == "torch":
+        tensor = tensor.to(device=metadata["orig_device"], dtype=metadata["orig_dtype"])
+        return tensor
+
+    # NumPy output
+    tensor = tensor.detach().cpu()
+    if not tensor.is_floating_point():
+        tensor = tensor.to(torch.float32)
+    array = tensor.numpy().astype(metadata["orig_dtype"], copy=False)
+    return array
+
+
 def p2e_and_blend_torch(
-    perspective: torch.Tensor,
-    equi_base: torch.Tensor,
+    perspective,
+    equi_base,
     fov_deg: tuple,
     u_deg: float,
     v_deg: float,
@@ -27,11 +132,9 @@ def p2e_and_blend_torch(
     """
     Project perspective image onto equirectangular base with blending.
 
-    Pure PyTorch implementation - no NumPy dependencies.
-
     Args:
-        perspective: torch.Tensor, BHWC, float32, [0,1] - Perspective image(s)
-        equi_base: torch.Tensor, BHWC, float32, [0,1] - Equirectangular base image(s)
+        perspective: torch.Tensor or np.ndarray - Perspective image(s)
+        equi_base: torch.Tensor or np.ndarray - Equirectangular base image(s)
         fov_deg: tuple (fov_w, fov_h) - Field of view in degrees
         u_deg: float - Horizontal rotation in degrees (yaw)
         v_deg: float - Vertical rotation in degrees (pitch)
@@ -51,22 +154,25 @@ def p2e_and_blend_torch(
         else:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Move inputs to device and ensure float32 (grid_sample doesn't support BFloat16)
-    perspective = perspective.to(device=device, dtype=torch.float32)
-    equi_base = equi_base.to(device=device, dtype=torch.float32)
+    # Normalize and move inputs to device as BHWC float32
+    perspective_t, persp_meta = _to_bhwc_tensor(perspective, device=device)
+    equi_base_t, equi_meta = _to_bhwc_tensor(equi_base, device=device)
+
+    if persp_meta["input_type"] != equi_meta["input_type"]:
+        raise TypeError("perspective and equi_base must be the same container type (both numpy or both torch).")
 
     # Batch handling
-    b_persp = perspective.shape[0]
-    b_equi = equi_base.shape[0]
+    b_persp = perspective_t.shape[0]
+    b_equi = equi_base_t.shape[0]
 
     if b_persp == b_equi:
         batch_size = b_persp
     elif b_persp == 1:
         batch_size = b_equi
-        perspective = perspective.expand(b_equi, -1, -1, -1)
+        perspective_t = perspective_t.expand(b_equi, -1, -1, -1)
     elif b_equi == 1:
         batch_size = b_persp
-        equi_base = equi_base.expand(b_persp, -1, -1, -1)
+        equi_base_t = equi_base_t.expand(b_persp, -1, -1, -1)
     else:
         raise ValueError(
             f"Incompatible batch sizes: perspective={b_persp}, equi_base={b_equi}. "
@@ -80,8 +186,8 @@ def p2e_and_blend_torch(
         p2e_and_blend_torch._gauss_cache = {}
 
     # Extract dimensions
-    h_eq, w_eq = equi_base.shape[1:3]
-    h_p, w_p = perspective.shape[1:3]
+    h_eq, w_eq = equi_base_t.shape[1:3]
+    h_p, w_p = perspective_t.shape[1:3]
     fov_w, fov_h = float(fov_deg[0]), float(fov_deg[1])
 
     # Create cache key with device string
@@ -181,7 +287,7 @@ def p2e_and_blend_torch(
     grid = grid.to(dtype=torch.float32)
 
     # Convert BHWC → BCHW for grid_sample
-    pers_bchw = perspective.permute(0, 3, 1, 2)
+    pers_bchw = perspective_t.permute(0, 3, 1, 2)
 
     # Scale to [0,255] range for better float32 precision during interpolation
     # (matches original implementation which loaded uint8 images)
@@ -245,17 +351,22 @@ def p2e_and_blend_torch(
     # Blending
     # -------------------------
     # Expand alpha for batch and channels [B, H, W, C]
-    num_channels = equi_base.shape[3]
+    num_channels = equi_base_t.shape[3]
     alpha_bhwc = alpha.unsqueeze(0).unsqueeze(-1)  # [1, H, W, 1]
     alpha_bhwc = alpha_bhwc.expand(batch_size, -1, -1, num_channels)
 
     # Alpha blend: merged = base * (1 - alpha) + patch * alpha
-    merged = equi_base * (1.0 - alpha_bhwc) + patch_360 * alpha_bhwc
+    merged = equi_base_t * (1.0 - alpha_bhwc) + patch_360 * alpha_bhwc
 
     # Prepare mask output [B, H, W]
     mask_out = alpha.unsqueeze(0).expand(batch_size, -1, -1)
 
-    return merged, patch_360, mask_out
+    # Restore to original container/dtype/layout
+    merged_out = _restore_from_bhwc(merged, equi_meta)
+    patch_out = _restore_from_bhwc(patch_360, persp_meta)
+    mask_out = _restore_from_bhwc(mask_out.unsqueeze(-1), equi_meta)
+
+    return merged_out, patch_out, mask_out
 
 
 # -------------------------
@@ -324,8 +435,8 @@ class P2EAndBlendNode:
         Process perspective-to-equirectangular projection and blending.
 
         Args:
-            perspective: torch.Tensor, BHWC, float32, [0,1]
-            equi_base: torch.Tensor, BHWC, float32, [0,1]
+            perspective: torch.Tensor or np.ndarray, image in HWC/CHW/BHWC/BCHW
+            equi_base: torch.Tensor or np.ndarray, image in HWC/CHW/BHWC/BCHW
             fov_w: float, horizontal FOV in degrees
             fov_h: float, vertical FOV in degrees
             u_deg: float, horizontal rotation in degrees
@@ -335,10 +446,6 @@ class P2EAndBlendNode:
         Returns:
             tuple: (merged, patch_360, mask)
         """
-        # Validate inputs
-        assert perspective.dim() == 4, f"perspective should be 4D BHWC, got {perspective.shape}"
-        assert equi_base.dim() == 4, f"equi_base should be 4D BHWC, got {equi_base.shape}"
-
         # Call pure torch function
         merged, patch_360, mask = p2e_and_blend_torch(
             perspective=perspective,
