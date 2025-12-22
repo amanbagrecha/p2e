@@ -385,8 +385,12 @@ class P2EAndBlendNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "perspective": ("IMAGE",),
-                "equi_base": ("IMAGE",),
+                "perspective": ("IMAGE", {
+                    "tooltip": "The perspective image to project onto the equirectangular base"
+                }),
+                "equi_base": ("IMAGE", {
+                    "tooltip": "The equirectangular panorama base image onto which the perspective will be projected"
+                }),
                 "fov_w": ("FLOAT", {
                     "default": 140.0,
                     "min": 1.0,
@@ -402,18 +406,18 @@ class P2EAndBlendNode:
                     "tooltip": "Vertical field of view in degrees"
                 }),
                 "u_deg": ("FLOAT", {
-                    "default": 0.0,
+                    "default": 180,
                     "min": -180.0,
                     "max": 180.0,
                     "step": 0.1,
-                    "tooltip": "Horizontal rotation in degrees (yaw)"
+                    "tooltip": "Horizontal rotation in degrees (yaw). Range: -180 to 180"
                 }),
                 "v_deg": ("FLOAT", {
-                    "default": 0.0,
+                    "default": -70,
                     "min": -90.0,
                     "max": 90.0,
                     "step": 0.1,
-                    "tooltip": "Vertical rotation in degrees (pitch)"
+                    "tooltip": "Vertical rotation in degrees (pitch). Range: -90 to 90"
                 }),
                 "feather": ("INT", {
                     "default": 10,
@@ -427,8 +431,13 @@ class P2EAndBlendNode:
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "MASK")
     RETURN_NAMES = ("merged", "patch_360", "mask")
+    OUTPUT_TOOLTIPS = (
+        "The final blended result combining the equirectangular base with the projected perspective image",
+        "The perspective image projected onto equirectangular coordinates (before blending)",
+        "The blending mask showing the projection area with feathering applied"
+    )
     FUNCTION = "process"
-    CATEGORY = "image/360"
+    CATEGORY = "p2e"
 
     def process(self, perspective, equi_base, fov_w, fov_h, u_deg, v_deg, feather):
         """
