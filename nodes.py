@@ -391,7 +391,12 @@ def p2e_and_blend_torch(
     # Restore to original container/dtype/layout
     merged_out = _restore_from_bhwc(merged, equi_meta)
     patch_out = _restore_from_bhwc(patch_360, persp_meta)
-    mask_out = _restore_from_bhwc(mask_out.unsqueeze(-1), equi_meta)
+
+    # Masks in ComfyUI are expected as BHW float32 in [0,1]
+    if equi_meta["input_type"] == "torch":
+        mask_out = mask_out.to(device=equi_meta["orig_device"], dtype=torch.float32)
+    else:
+        mask_out = mask_out.detach().cpu().to(torch.float32).numpy()
 
     return merged_out, patch_out, mask_out
 
