@@ -1,8 +1,7 @@
 """
-ComfyUI Custom Node: Perspective to Equirectangular with Blending
+ComfyUI Custom Node: Perspective to Equirectangular
 
-Provides nodes for projecting perspective images onto equirectangular panoramas
-with seamless blending.
+Provides nodes for projecting perspective images onto equirectangular panoramas.
 
 Installation:
     Place this folder in ComfyUI/custom_nodes/

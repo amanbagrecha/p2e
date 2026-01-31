@@ -1,54 +1,31 @@
-# Perspective to Equirectangular (P2E) ComfyUI Node
+# Perspective to Equirectangular ComfyUI Node
 
-A custom ComfyUI node that projects perspective images onto an equirectangular panorama with optional feathered blending. The core implementation is written in PyTorch and now accepts either NumPy arrays or torch tensors, automatically adapting shapes and returning outputs in the same container type.
+Project a perspective image onto an equirectangular panorama with optional feathered blending.
 
-## Features
-- Perspective-to-equirectangular projection with cached sampling grids for speed
-- Feathered blending to soften seams
-- Flexible input handling for NumPy arrays or torch tensors (HWC/CHW/BHWC/BCHW)
-- Ready for use inside ComfyUI or as a standalone Python utility
+![Demo workflow](readme-demo.png)
 
-## Installation
-1. Clone or download this repository.
-2. Copy the `p2e` folder into your `ComfyUI/custom_nodes/` directory.
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Restart ComfyUI.
+## Node
+Category: `p2e`
 
-## Node Usage
-The node appears under `image/360` as **Perspective to Equirectangular + Blend**. Required inputs:
-- **Perspective**: image tensor/array
-- **Equirectangular Base**: target panorama
-- **FOV W / FOV H**: horizontal and vertical field of view in degrees
-- **U Deg / V Deg**: yaw and pitch rotations in degrees
-- **Feather**: blur radius for edge blending
+**Inputs**
+- `perspective` (IMAGE): perspective image to project.
+- `equi_base` (IMAGE): target equirectangular panorama.
+- `fov_w` (FLOAT): horizontal field of view in degrees, range 1–180 (default 140).
+- `fov_h` (FLOAT): vertical field of view in degrees, range 1–180 (default 140).
+- `u_deg` (FLOAT): yaw rotation in degrees, range -180–180 (default 180).
+- `v_deg` (FLOAT): pitch rotation in degrees, range -90–90 (default -70).
+- `feather` (INT): edge blend radius in pixels, range 0–200 (default 10).
 
-Outputs:
-1. **Merged** panorama
-2. **Patch 360**: warped perspective patch
-3. **Mask**: blend mask (same container type as inputs)
+**Outputs**
+- `merged` (IMAGE): blended panorama.
+- `patch_360` (IMAGE): projected patch in equirectangular space.
+- `mask` (MASK): blend mask for the projection area.
 
-## Standalone Usage
-You can also call the core function directly:
-```python
-from p2e.nodes import p2e_and_blend_torch
-import numpy as np
-
-# perspective_np and equi_base_np are HWC NumPy arrays in [0, 255] or [0, 1]
-merged, patch, mask = p2e_and_blend_torch(
-    perspective=perspective_np,
-    equi_base=equi_base_np,
-    fov_deg=(140, 140),
-    u_deg=180,
-    v_deg=-70,
-    feather=10,
-)
-```
-
-Both NumPy arrays and torch tensors are supported; outputs mirror the input container type and layout.
+## Install
+1. Copy the `p2e` folder into `ComfyUI/custom_nodes/`.
+2. Install dependencies: `pip install -r requirements.txt`.
+3. Restart ComfyUI.
 
 ## Notes
-- If ComfyUI is available, the node will automatically use its configured torch device. Otherwise, it falls back to CUDA when available.
-- Integer image inputs are normalized internally and restored to their original dtype on output.
+- Uses cached sampling grids for speed.
+- Accepts NumPy arrays or torch tensors (HWC/CHW/BHWC/BCHW) and preserves container type.

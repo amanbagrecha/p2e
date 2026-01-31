@@ -11,6 +11,7 @@ import numpy as np
 
 try:
     import comfy.model_management as mm
+
     COMFY_AVAILABLE = True
 except ImportError:
     COMFY_AVAILABLE = False
@@ -37,7 +38,9 @@ def _to_bhwc_tensor(image, device=None):
         tensor = image
         orig_device = image.device
     else:
-        raise TypeError(f"Unsupported image type: {type(image)}. Expected numpy array or torch tensor.")
+        raise TypeError(
+            f"Unsupported image type: {type(image)}. Expected numpy array or torch tensor."
+        )
 
     layout = None
     if tensor.dim() == 2:
@@ -64,7 +67,9 @@ def _to_bhwc_tensor(image, device=None):
         else:
             raise ValueError(f"Unsupported 4D layout with shape {tuple(tensor.shape)}")
     else:
-        raise ValueError(f"Unsupported tensor dimensions: {tensor.dim()}. Expected 2D-4D image tensor.")
+        raise ValueError(
+            f"Unsupported tensor dimensions: {tensor.dim()}. Expected 2D-4D image tensor."
+        )
 
     # Normalize to float32 in [0,1]
     if tensor.is_floating_point():
@@ -127,7 +132,7 @@ def p2e_and_blend_torch(
     u_deg: float,
     v_deg: float,
     feather: int = 0,
-    device: torch.device = None
+    device: torch.device = None,
 ) -> tuple:
     """
     Project perspective image onto equirectangular base with blending.
@@ -159,7 +164,9 @@ def p2e_and_blend_torch(
     equi_base_t, equi_meta = _to_bhwc_tensor(equi_base, device=device)
 
     if persp_meta["input_type"] != equi_meta["input_type"]:
-        raise TypeError("perspective and equi_base must be the same container type (both numpy or both torch).")
+        raise TypeError(
+            "perspective and equi_base must be the same container type (both numpy or both torch)."
+        )
 
     # Batch handling
     b_persp = perspective_t.shape[0]
@@ -192,7 +199,17 @@ def p2e_and_blend_torch(
 
     # Create cache key with device string
     device_str = str(device)
-    cache_key = (h_eq, w_eq, h_p, w_p, fov_w, fov_h, float(u_deg), float(v_deg), device_str)
+    cache_key = (
+        h_eq,
+        w_eq,
+        h_p,
+        w_p,
+        fov_w,
+        fov_h,
+        float(u_deg),
+        float(v_deg),
+        device_str,
+    )
 
     # -------------------------
     # Grid generation (cached)
@@ -202,7 +219,7 @@ def p2e_and_blend_torch(
         eq_y, eq_x = torch.meshgrid(
             torch.arange(h_eq, device=device, dtype=torch.float32),
             torch.arange(w_eq, device=device, dtype=torch.float32),
-            indexing="ij"
+            indexing="ij",
         )
 
         # Convert to spherical coordinates
@@ -216,8 +233,12 @@ def p2e_and_blend_torch(
         xyz = torch.stack([x, y, z], dim=-1)
 
         # Rotation angles
-        u = torch.deg2rad(torch.tensor(float(u_deg), device=device, dtype=torch.float32))
-        v = torch.deg2rad(torch.tensor(float(-v_deg), device=device, dtype=torch.float32))
+        u = torch.deg2rad(
+            torch.tensor(float(u_deg), device=device, dtype=torch.float32)
+        )
+        v = torch.deg2rad(
+            torch.tensor(float(-v_deg), device=device, dtype=torch.float32)
+        )
 
         cu, su = torch.cos(u), torch.sin(u)
         cv, sv = torch.cos(v), torch.sin(v)
@@ -226,17 +247,23 @@ def p2e_and_blend_torch(
         o1 = torch.tensor(1.0, device=device, dtype=torch.float32)
 
         # Rotation matrices
-        Ry = torch.stack([
-            torch.stack([ cu, z0, -su]),
-            torch.stack([ z0, o1,  z0]),
-            torch.stack([ su, z0,  cu]),
-        ], dim=0)
+        Ry = torch.stack(
+            [
+                torch.stack([cu, z0, -su]),
+                torch.stack([z0, o1, z0]),
+                torch.stack([su, z0, cu]),
+            ],
+            dim=0,
+        )
 
-        Rx = torch.stack([
-            torch.stack([ o1, z0,  z0]),
-            torch.stack([ z0,  cv, -sv]),
-            torch.stack([ z0,  sv,  cv]),
-        ], dim=0)
+        Rx = torch.stack(
+            [
+                torch.stack([o1, z0, z0]),
+                torch.stack([z0, cv, -sv]),
+                torch.stack([z0, sv, cv]),
+            ],
+            dim=0,
+        )
 
         # Apply rotation
         R = Ry @ Rx
@@ -251,8 +278,12 @@ def p2e_and_blend_torch(
         y_p = xyz_cam[..., 1] / z_safe
 
         # FOV calculations
-        tan_h = torch.tan(torch.deg2rad(torch.tensor(fov_w, device=device, dtype=torch.float32)) / 2.0)
-        tan_v = torch.tan(torch.deg2rad(torch.tensor(fov_h, device=device, dtype=torch.float32)) / 2.0)
+        tan_h = torch.tan(
+            torch.deg2rad(torch.tensor(fov_w, device=device, dtype=torch.float32)) / 2.0
+        )
+        tan_v = torch.tan(
+            torch.deg2rad(torch.tensor(fov_h, device=device, dtype=torch.float32)) / 2.0
+        )
 
         # Check if within FOV
         in_fov = valid & (x_p.abs() <= tan_h) & (y_p.abs() <= tan_v)
@@ -273,7 +304,7 @@ def p2e_and_blend_torch(
         grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
 
         # Create mask (HW, uint8 with values 0 or 255)
-        mask_t = (in_fov.to(torch.uint8) * 255)
+        mask_t = in_fov.to(torch.uint8) * 255
 
         # Store in cache
         p2e_and_blend_torch._grid_cache[cache_key] = (grid, mask_t)
@@ -298,11 +329,7 @@ def p2e_and_blend_torch(
 
     # Apply grid_sample (requires float32 inputs)
     out_bchw = F.grid_sample(
-        pers_bchw,
-        grid_batch,
-        mode="bilinear",
-        padding_mode="zeros",
-        align_corners=True
+        pers_bchw, grid_batch, mode="bilinear", padding_mode="zeros", align_corners=True
     )
 
     # Convert BCHW → BHWC
@@ -345,7 +372,7 @@ def p2e_and_blend_torch(
 
         alpha = m_blur.squeeze(0).squeeze(0)  # [H, W]
     else:
-        alpha = (mask_t.to(torch.float32) / 255.0)  # [H, W] in [0,1]
+        alpha = mask_t.to(torch.float32) / 255.0  # [H, W] in [0,1]
 
     # -------------------------
     # Blending
@@ -373,6 +400,7 @@ def p2e_and_blend_torch(
 # ComfyUI Node Class
 # -------------------------
 
+
 class P2EAndBlendNode:
     """
     Perspective to Equirectangular with Blending
@@ -385,47 +413,68 @@ class P2EAndBlendNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "perspective": ("IMAGE", {
-                    "tooltip": "The perspective image to project onto the equirectangular base"
-                }),
-                "equi_base": ("IMAGE", {
-                    "tooltip": "The equirectangular panorama base image onto which the perspective will be projected"
-                }),
-                "fov_w": ("FLOAT", {
-                    "default": 140.0,
-                    "min": 1.0,
-                    "max": 180.0,
-                    "step": 0.1,
-                    "tooltip": "Horizontal field of view in degrees"
-                }),
-                "fov_h": ("FLOAT", {
-                    "default": 140.0,
-                    "min": 1.0,
-                    "max": 180.0,
-                    "step": 0.1,
-                    "tooltip": "Vertical field of view in degrees"
-                }),
-                "u_deg": ("FLOAT", {
-                    "default": 180,
-                    "min": -180.0,
-                    "max": 180.0,
-                    "step": 0.1,
-                    "tooltip": "Horizontal rotation in degrees (yaw). Range: -180 to 180"
-                }),
-                "v_deg": ("FLOAT", {
-                    "default": -70,
-                    "min": -90.0,
-                    "max": 90.0,
-                    "step": 0.1,
-                    "tooltip": "Vertical rotation in degrees (pitch). Range: -90 to 90"
-                }),
-                "feather": ("INT", {
-                    "default": 10,
-                    "min": 0,
-                    "max": 200,
-                    "step": 1,
-                    "tooltip": "Feather/blur radius for blending edge"
-                }),
+                "perspective": (
+                    "IMAGE",
+                    {
+                        "tooltip": "The perspective image to project onto the equirectangular base"
+                    },
+                ),
+                "equi_base": (
+                    "IMAGE",
+                    {
+                        "tooltip": "The equirectangular panorama base image onto which the perspective will be projected"
+                    },
+                ),
+                "fov_w": (
+                    "FLOAT",
+                    {
+                        "default": 140.0,
+                        "min": 1.0,
+                        "max": 180.0,
+                        "step": 0.1,
+                        "tooltip": "Horizontal field of view in degrees",
+                    },
+                ),
+                "fov_h": (
+                    "FLOAT",
+                    {
+                        "default": 140.0,
+                        "min": 1.0,
+                        "max": 180.0,
+                        "step": 0.1,
+                        "tooltip": "Vertical field of view in degrees",
+                    },
+                ),
+                "u_deg": (
+                    "FLOAT",
+                    {
+                        "default": 180,
+                        "min": -180.0,
+                        "max": 180.0,
+                        "step": 0.1,
+                        "tooltip": "Horizontal rotation in degrees (yaw). Range: -180 to 180",
+                    },
+                ),
+                "v_deg": (
+                    "FLOAT",
+                    {
+                        "default": -70,
+                        "min": -90.0,
+                        "max": 90.0,
+                        "step": 0.1,
+                        "tooltip": "Vertical rotation in degrees (pitch). Range: -90 to 90",
+                    },
+                ),
+                "feather": (
+                    "INT",
+                    {
+                        "default": 10,
+                        "min": 0,
+                        "max": 200,
+                        "step": 1,
+                        "tooltip": "Feather/blur radius for blending edge",
+                    },
+                ),
             },
         }
 
@@ -434,7 +483,7 @@ class P2EAndBlendNode:
     OUTPUT_TOOLTIPS = (
         "The final blended result combining the equirectangular base with the projected perspective image",
         "The perspective image projected onto equirectangular coordinates (before blending)",
-        "The blending mask showing the projection area with feathering applied"
+        "The blending mask showing the projection area with feathering applied",
     )
     FUNCTION = "process"
     CATEGORY = "p2e"
@@ -463,7 +512,7 @@ class P2EAndBlendNode:
             u_deg=u_deg,
             v_deg=v_deg,
             feather=feather,
-            device=None  # Let function determine device
+            device=None,  # Let function determine device
         )
 
         return (merged, patch_360, mask)
@@ -474,9 +523,9 @@ class P2EAndBlendNode:
 # -------------------------
 
 NODE_CLASS_MAPPINGS = {
-    "P2E And Blend": P2EAndBlendNode,
+    "Perspective to Equirectangular": P2EAndBlendNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "P2E And Blend": "Perspective to Equirectangular + Blend",
+    "Perspective to Equirectangular": "Perspective to Equirectangular",
 }

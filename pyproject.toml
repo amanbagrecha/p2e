@@ -11,4 +11,4 @@ dependencies = [
 
 [tool.comfy]
 PublisherId = "amanbagrecha"
-DisplayName = "P2E (Perspective → Equirectangular)"
+DisplayName = "Perspective to Equirectangular"
